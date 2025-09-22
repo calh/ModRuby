@@ -1,37 +1,39 @@
-FROM centos:centos7
+FROM oraclelinux:8
 
-RUN yum install -y epel-release && yum -y upgrade && yum install -y \
-  apr-devel \
-  apr-util \
-  apr-util-devel \
-  autoconf \
-  automake \
-  bison \
-  bzip2 \
-  cmake3 \
-  curl \
-  cyrus-sasl \
-  cyrus-sasl-devel \
-  flex \
-  flex-devel \
-  gcc \
-  gcc-c++ \
-  gdb \
-  git \
-  gpg \
-  httpd \
-  httpd-devel \
-  libffi-devel \
-  libtool \
-  libyaml \
-  openssl-devel \
-  patch \
-  readline-devel \
-  sqlite-devel \
-  make \
-  redhat-lsb \
-  unzip \
-  zlib-devel 
+RUN dnf install -y oraclelinux-release-el8 oracle-epel-release-el8 \
+  && dnf --enablerepo=ol8_codeready_builder install -y \
+    apr-devel \
+    apr-util \
+    apr-util-devel \
+    autoconf \
+    automake \
+    bison \
+    bzip2 \
+    cmake3 \
+    curl \
+    cyrus-sasl \
+    cyrus-sasl-devel \
+    flex \
+    gcc \
+    gcc-c++ \
+    gdb \
+    git \
+    gpg \
+    httpd \
+    httpd-devel \
+    libffi-devel \
+    libtool \
+    libyaml \
+    libyaml-devel \
+    openssl-devel \
+    patch \
+    readline-devel \
+    ruby \
+    sqlite-devel \
+    make \
+    redhat-lsb \
+    unzip \
+    zlib-devel 
 
 # Import GPG key for RVM
 RUN gpg \
@@ -52,7 +54,7 @@ SHELL ["/bin/bash", "-l", "-c"]
 RUN rvm requirements
 
 # Pick your ruby version here
-RUN rvm install ruby-2.3.3
+RUN rvm install ruby-3.2.3
 
 # Setup our libruby.so dir in ld.so.conf
 RUN rvm config-get libdir > /etc/ld.so.conf.d/ruby.conf && ldconfig
