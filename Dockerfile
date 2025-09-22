@@ -1,37 +1,39 @@
 FROM centos:centos7
 
-RUN yum install -y epel-release && yum -y upgrade && yum install -y \
-  apr-devel \
-  apr-util \
-  apr-util-devel \
-  autoconf \
-  automake \
-  bison \
-  bzip2 \
-  cmake3 \
-  curl \
-  cyrus-sasl \
-  cyrus-sasl-devel \
-  flex \
-  flex-devel \
-  gcc \
-  gcc-c++ \
-  gdb \
-  git \
-  gpg \
-  httpd \
-  httpd-devel \
-  libffi-devel \
-  libtool \
-  libyaml \
-  openssl-devel \
-  patch \
-  readline-devel \
-  sqlite-devel \
-  make \
-  redhat-lsb \
-  unzip \
-  zlib-devel 
+RUN sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-Base.repo \
+  && sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-Base.repo \
+  && yum install -y epel-release && yum -y upgrade && yum install -y \
+    apr-devel \
+    apr-util \
+    apr-util-devel \
+    autoconf \
+    automake \
+    bison \
+    bzip2 \
+    cmake3 \
+    curl \
+    cyrus-sasl \
+    cyrus-sasl-devel \
+    flex \
+    flex-devel \
+    gcc \
+    gcc-c++ \
+    gdb \
+    git \
+    gpg \
+    httpd \
+    httpd-devel \
+    libffi-devel \
+    libtool \
+    libyaml \
+    openssl-devel \
+    patch \
+    readline-devel \
+    sqlite-devel \
+    make \
+    redhat-lsb \
+    unzip \
+    zlib-devel 
 
 # Import GPG key for RVM
 RUN gpg \
