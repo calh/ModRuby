@@ -54,7 +54,11 @@ SHELL ["/bin/bash", "-l", "-c"]
 RUN rvm requirements
 
 # Pick your ruby version here
-RUN rvm install ruby-3.2.3
+# Segfaults in rb_protect()
+#RUN rvm install ruby-3.2.3
+# Works
+#RUN rvm install ruby-2.7.5
+RUN rvm install ruby-3.0.3
 
 # Setup our libruby.so dir in ld.so.conf
 RUN rvm config-get libdir > /etc/ld.so.conf.d/ruby.conf && ldconfig
