@@ -55,9 +55,9 @@ RUN rvm requirements
 
 # Pick your ruby version here
 # Segfaults in rb_protect()
-#RUN rvm install ruby-3.2.3
+RUN rvm install ruby-3.2.3
 # Works
-RUN rvm install ruby-2.7.5
+#RUN rvm install ruby-2.7.5
 # Same segfault as 3.2.3
 #RUN rvm install ruby-3.0.3
 
