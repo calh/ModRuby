@@ -1,3 +1,4 @@
+# This builds a docker image suitable for running OpenAI's codex CLI 
 FROM oraclelinux:8
 
 RUN dnf install -y oraclelinux-release-el8 oracle-epel-release-el8 \
@@ -33,7 +34,10 @@ RUN dnf install -y oraclelinux-release-el8 oracle-epel-release-el8 \
     make \
     redhat-lsb \
     unzip \
-    zlib-devel 
+    zlib-devel \
+  && dnf module enable nodejs:22 \
+  && dnf install nodejs nodejs-devel npm \
+  && npm install -g @openai/codex
 
 # Import GPG key for RVM
 RUN gpg \
@@ -55,7 +59,7 @@ RUN rvm requirements
 
 # Pick your ruby version here
 # Segfaults in rb_protect()
-RUN rvm install ruby-3.2.3
+RUN rvm install ruby-3.2.3 --disable-binary 
 # Works
 #RUN rvm install ruby-2.7.5
 # Same segfault as 3.2.3
@@ -86,10 +90,11 @@ COPY docker/*.cgi /var/www/cgi-bin/
 COPY docker/httpd.conf /etc/httpd/conf/httpd.conf
 COPY docker/gdb.input /gdb.input
 COPY docker/httpd-gdb /httpd-gdb
+COPY docker/httpd-gdb-loop /httpd-gdb-loop
 
 # Force apache logs to docker console logs
-RUN ln -sf /dev/console /var/log/httpd/access_log \
-  && ln -sf /dev/console /var/log/httpd/error_log 
+#RUN ln -sf /dev/console /var/log/httpd/access_log \
+#  && ln -sf /dev/console /var/log/httpd/error_log 
 
 # Graceful shutdown signal for apache
 # (Requires Docker > 1.11)

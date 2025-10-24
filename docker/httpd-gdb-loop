@@ -1,0 +1,88 @@
+#!/bin/bash
+# This is similar to httpd-gdb, except it's more hands-off and
+# better suited for automated testing.  If apache crashes the 
+# stack trace will be written to /var/log/httpd/gdb_backtrace.txt
+# and then apache is restarted.  Each new crash will delete the
+# backtrace log and dump the fresh backtrace into it.
+#set -euo pipefail
+
+# Config
+TRACE_FILE="${TRACE_FILE:-/var/log/httpd/gdb_backtrace.txt}"
+
+mkdir -p "$(dirname "$TRACE_FILE")"
+
+# Clean previous trace each run
+rm -f "$TRACE_FILE"
+
+# Ensure child gdb/httpd dies if this script is killed
+trap 'pkill -P $$ || true' INT TERM
+
+while :; do
+  ts="$(date -Is)"
+  tmp="${TRACE_FILE}.tmp"
+
+  echo "[$ts] starting httpd"
+
+  rm -f /var/run/httpd/httpd.pid
+
+  /usr/sbin/httpd 1>>"$tmp" 2>>"$tmp"
+
+  ret=$?
+  if [[ "$ret" != "0" ]]; then
+    {
+      echo "Failed to start up Apache:"
+      echo 
+    } >>"$tmp"
+    mv -f "$tmp" "$TRACE_FILE"
+    # longer sleep time on big time fails
+    sleep 10
+    continue
+  fi
+
+  sleep 2
+  pid=$(ps ax |grep /usr/sbin/httpd |grep -v grep | grep -v defunct | awk '{print $1}' |tail -1)
+  echo "httpd fork pid: $pid"
+  
+  # If apache started up successfully and the previous trace file 
+  # contains a fail message, delete the trace file.  We want to keep
+  # backtraces intact for observability though.
+  if grep -q "Failed to start up Apache" "$TRACE_FILE"; then
+    echo "Deleting trace file"
+    rm -f "$TRACE_FILE"
+  fi 
+
+    #-ex "set detach-on-fork on" \
+    #-ex "handle SIGPIPE nostop noprint pass" \
+    #-ex "handle SIGSEGV stop print nopass" \
+    #-ex "set follow-fork-mode child" \
+  gdb -p $pid -q --batch \
+    -ex "set pagination off" \
+    -ex "set confirm off" \
+    -ex "handle SIGPIPE nostop noprint pass" \
+    -ex "handle SIGSEGV stop print nopass" \
+    -ex "continue" \
+    -ex "echo \n===== THREAD BACKTRACE =====\n" \
+    -ex "thread apply all bt full" \
+    -ex "echo \n===== REGISTERS =====\n" \
+    -ex "info registers" \
+    2>&1 | tee "$tmp"
+
+  # If it crashed, keep the trace; else discard.
+  if grep -q "received signal SIGSEGV" "$tmp"; then
+    {
+      echo "===== TIMESTAMP ====="
+      echo "$ts"
+    } >>"$tmp"
+    mv -f "$tmp" "$TRACE_FILE"
+    echo "segfault detected. backtrace saved to: $TRACE_FILE"
+  else
+    cat "$tmp"
+    rm -f "$tmp"
+    echo "no segfault detected. restarting."
+  fi
+
+  ps ax |grep /usr/sbin/httpd |grep -v grep | grep -v defunct | awk '{print $1}' | xargs kill -9
+
+  sleep 2
+done
+

@@ -2,9 +2,17 @@
 #include <httpd.h>
 #include <http_log.h>
 
+#include <condition_variable>
+#include <deque>
+#include <future>
 #include <map>
-#include <string>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <functional>
 
 #include "ruby.hpp"
 #include "request.h"
@@ -23,6 +31,9 @@
 #include "config.h"
 
 #include "module.hpp"
+#include <ruby/thread.h>
+
+extern "C" int ruby_thread_has_gvl_p(void);
 
 #if AP_SERVER_MINORVERSION_NUMBER >= 4
 APLOG_USE_MODULE();
@@ -31,6 +42,199 @@ APLOG_USE_MODULE();
 typedef VALUE (*fn)(...);
 
 using namespace std;
+
+namespace
+{
+// RubyDispatcher owns the embedded Ruby VM and runs all Ruby-facing work on
+// a single dedicated OS thread. Apache worker threads hand off callable jobs
+// so that Ruby APIs are always invoked from a Ruby-managed thread with the
+// GVL held.
+class RubyDispatcher
+{
+public:
+    static RubyDispatcher& instance()
+    {
+        static RubyDispatcher dispatcher;
+        return dispatcher;
+    }
+
+    // Launches the dispatcher thread and blocks until the Ruby VM is ready.
+    void start()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (thread_started_)
+        {
+            ready_cv_.wait(lock, [this]() { return ready_; });
+            return;
+        }
+
+        shutting_down_ = false;
+        ready_ = false;
+        thread_exception_ = nullptr;
+        worker_thread_ = std::thread(&RubyDispatcher::run, this);
+        thread_started_ = true;
+
+        ready_cv_.wait(lock, [this]() { return ready_; });
+
+        if (thread_exception_)
+        {
+            std::rethrow_exception(thread_exception_);
+        }
+    }
+
+    // Indicates whether the dispatcher thread is currently running.
+    bool is_started() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return thread_started_;
+    }
+
+    // Signals the dispatcher thread to drain pending work and shut down the VM.
+    void stop()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (!thread_started_)
+        {
+            return;
+        }
+
+        shutting_down_ = true;
+        cv_.notify_all();
+        lock.unlock();
+
+        if (worker_thread_.joinable())
+        {
+            worker_thread_.join();
+        }
+
+        lock.lock();
+        jobs_.clear();
+        thread_started_ = false;
+        ready_ = false;
+        thread_exception_ = nullptr;
+    }
+
+    // Synchronously executes a job on the Ruby dispatcher thread.
+    int execute(std::function<int()> task)
+    {
+        if (ruby_thread_has_gvl_p())
+        {
+            return task();
+        }
+
+        std::unique_ptr<Job> job(new Job());
+        auto future = job->promise.get_future();
+        job->task = std::move(task);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (!thread_started_)
+            {
+                throw std::runtime_error("Ruby dispatcher thread not started");
+            }
+
+            jobs_.push_back(std::move(job));
+        }
+
+        cv_.notify_one();
+
+        return future.get();
+    }
+
+private:
+    struct Job
+    {
+        std::function<int()> task;
+        std::promise<int> promise;
+    };
+
+    RubyDispatcher() = default;
+
+    // Dispatcher main loop: owns the Ruby VM and processes queued jobs.
+    void run()
+    {
+        try
+        {
+            ruby::startup("ModRuby Ruby VM");
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ready_ = true;
+                ready_cv_.notify_all();
+            }
+
+            while (true)
+            {
+                std::unique_ptr<Job> job;
+
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [this]() {
+                        return shutting_down_ || !jobs_.empty();
+                    });
+
+                    if (shutting_down_ && jobs_.empty())
+                    {
+                        break;
+                    }
+
+                    job = std::move(jobs_.front());
+                    jobs_.pop_front();
+                }
+
+                try
+                {
+                    int result = job->task();
+                    job->promise.set_value(result);
+                }
+                catch (...)
+                {
+                    job->promise.set_exception(std::current_exception());
+                }
+            }
+
+            ruby::shutdown();
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            thread_exception_ = std::current_exception();
+            ready_ = true;
+            ready_cv_.notify_all();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::condition_variable ready_cv_;
+    std::deque<std::unique_ptr<Job>> jobs_;
+    std::thread worker_thread_;
+    bool thread_started_ = false;
+    bool ready_ = false;
+    bool shutting_down_ = false;
+    std::exception_ptr thread_exception_;
+};
+
+// Runs the provided Apache handler while guaranteeing we are executing on the
+// Ruby dispatcher thread (and therefore with the GVL acquired). Callers may be
+// running on arbitrary Apache worker threads.
+int call_request_with_gvl(int (*func)(request_rec*), request_rec* r)
+{
+    if (ruby_thread_has_gvl_p())
+    {
+        return func(r);
+    }
+
+    auto job = [func, r]() -> int {
+        return func(r);
+    };
+
+    return RubyDispatcher::instance().execute(job);
+}
+} // namespace
 
 // Generic Ruby object to hold the the handler instance. A handler is a Ruby
 // class which works as the persistent Ruby server environment that handles all
@@ -78,173 +282,221 @@ int ruby_init_module(apr_pool_t* p, server_rec* server)
     ap_log_perror( APLOG_MARK, APLOG_NOTICE, 0, p,
                    "mod_ruby[%i]: startup_module", getpid() );
 
-    int x = getpid();
-
-    // Initialize the Ruby VM and load C extensions
     try
     {
-        // Start up VM
-        ruby::startup("ModRuby Ruby VM");
-
-        // Set default encoding to UTF-8.
-        //
-        // Ruby docs say not to do this within Ruby. So we do it here
-        // immediately on startup. Could do it this way:
-        //
-        //     rb_eval_string("Encoding.default_external='UTF-8'");
-        //
-        // But this is more 3733t
-        VALUE encoding = rb_const_get(rb_cObject, rb_intern("Encoding"));
-        rb_funcall( encoding, rb_intern("default_external="),
-                    1, rb_str_new_cstr("UTF-8") );
-
-        // Apache log constants for log() in ruby_request.cpp
-        rb_define_global_const("APLOG_EMERG",        INT2NUM(APLOG_EMERG));
-        rb_define_global_const("APLOG_ALERT",        INT2NUM(APLOG_ALERT));
-        rb_define_global_const("APLOG_CRIT",         INT2NUM(APLOG_CRIT));
-        rb_define_global_const("APLOG_ERR",          INT2NUM(APLOG_ERR));
-        rb_define_global_const("APLOG_WARNING",      INT2NUM(APLOG_WARNING));
-        rb_define_global_const("APLOG_NOTICE",       INT2NUM(APLOG_NOTICE));
-        rb_define_global_const("APLOG_INFO",         INT2NUM(APLOG_INFO));
-        rb_define_global_const("APLOG_DEBUG",        INT2NUM(APLOG_DEBUG));
-        rb_define_global_const("APLOG_LEVELMASK",    INT2NUM(APLOG_LEVELMASK));
-        rb_define_global_const("APLOG_NOERRNO",      INT2NUM(APLOG_NOERRNO));
-        rb_define_global_const("APLOG_TOCLIENT",     INT2NUM(APLOG_TOCLIENT));
-        rb_define_global_const("APLOG_STARTUP",      INT2NUM(APLOG_STARTUP));
-
-        // Apache method constants
-        rb_define_global_const("M_GET",              INT2NUM(M_GET));
-        rb_define_global_const("M_PUT",              INT2NUM(M_PUT));
-        rb_define_global_const("M_POST",             INT2NUM(M_POST));
-        rb_define_global_const("M_DELETE",           INT2NUM(M_DELETE));
-        rb_define_global_const("M_CONNECT",          INT2NUM(M_CONNECT));
-        rb_define_global_const("M_OPTIONS",          INT2NUM(M_OPTIONS));
-        rb_define_global_const("M_TRACE",            INT2NUM(M_TRACE));
-        rb_define_global_const("M_PATCH",            INT2NUM(M_PATCH));
-        rb_define_global_const("M_PROPFIND",         INT2NUM(M_PROPFIND));
-        rb_define_global_const("M_PROPPATCH",        INT2NUM(M_PROPPATCH));
-        rb_define_global_const("M_MKCOL",            INT2NUM(M_MKCOL));
-        rb_define_global_const("M_COPY",             INT2NUM(M_COPY));
-        rb_define_global_const("M_MOVE",             INT2NUM(M_MOVE));
-        rb_define_global_const("M_LOCK",             INT2NUM(M_LOCK));
-        rb_define_global_const("M_UNLOCK",           INT2NUM(M_UNLOCK));
-        rb_define_global_const("M_VERSION_CONTROL",  INT2NUM(M_VERSION_CONTROL));
-        rb_define_global_const("M_CHECKOUT",         INT2NUM(M_CHECKOUT));
-        rb_define_global_const("M_UNCHECKOUT",       INT2NUM(M_UNCHECKOUT));
-        rb_define_global_const("M_CHECKIN",          INT2NUM(M_CHECKIN));
-        rb_define_global_const("M_UPDATE",           INT2NUM(M_UPDATE));
-        rb_define_global_const("M_LABEL",            INT2NUM(M_LABEL));
-        rb_define_global_const("M_REPORT",           INT2NUM(M_REPORT));
-        rb_define_global_const("M_MKWORKSPACE",      INT2NUM(M_MKWORKSPACE));
-        rb_define_global_const("M_MKACTIVITY",       INT2NUM(M_MKACTIVITY));
-        rb_define_global_const("M_BASELINE_CONTROL", INT2NUM(M_BASELINE_CONTROL));
-        rb_define_global_const("M_MERGE",            INT2NUM(M_MERGE));
-        rb_define_global_const("M_INVALID",          INT2NUM(M_INVALID));
-        rb_define_global_const("M_METHODS",          INT2NUM(64));
-
-        // Submodules are registered under the Apache namespace
-        VALUE apache = rb_define_module("Apache");
-
-        // ModRuby module functions under ModRuby namespace
-        VALUE ruby = rb_define_module("ModRuby");
-
-        rb_define_module_function(ruby, "version", (fn)ruby_version, 0);
-        rb_define_module_function(ruby, "release_date", (fn)ruby_release_date, 0);
-
-        // RHTML scanner
-
-        init_rhtml();
-
-        // Initialize Ruby extensions/modules
-
-        init_request(apache);     // Apache request Ruby wrapper
-        init_server(apache);      // Apache server Ruby wrapper
-        init_connection(apache);  // Apache connection Ruby wrapper
-        init_process(apache);     // Apache process Ruby wrapper
-
-        VALUE apr = rb_define_module("APR");
-
-        init_apr(apr);           // Apache Portable Runtime (APR)
-        init_apr_array(apr);     // APR Arrays
-        init_apr_file_info(apr); // APR file functions
-        init_apr_pool(apr);      // APR pools
-        init_apr_table(apr);     // APR tables
-
-        // Load the Ruby handler module, which is a pure Ruby class
-        ruby::require("modruby/handler");
-
-        // Create the global Ruby handler instance.
-        ruby_handler = new ruby::Object("ModRuby::Handler");
-    }
-    catch (const ruby::Exception& e)
-    {
-        fprintf(stderr, "Ruby Exception: %s", e.what());
-
-        stringstream strm;
-        strm << "FATAL ERROR: " << e.what();
-        log_error(p, strm.str().c_str());
-
-        return 1;
+        RubyDispatcher::instance().start();
     }
     catch (const std::exception& e)
     {
-        fprintf(stderr, "C++ Exception: %s\n", e.what());
-
-        stringstream strm;
-        strm << "FATAL ERROR: " << e.what();
-        log_error(p, strm.str().c_str());
-
+        ap_log_perror( APLOG_MARK, APLOG_CRIT, 0, p,
+                       "mod_ruby[%i]: failed to start Ruby dispatcher: %s",
+                       getpid(), e.what() );
         return 1;
     }
 
-    return 0;
+    auto init_job = [p, server]() -> int
+    {
+        try
+        {
+            // Set default encoding to UTF-8.
+            //
+            // Ruby docs say not to do this within Ruby. So we do it here
+            // immediately on startup. Could do it this way:
+            //
+            //     rb_eval_string("Encoding.default_external='UTF-8'");
+            //
+            // But this is more 3733t
+            VALUE encoding = rb_const_get(rb_cObject, rb_intern("Encoding"));
+            rb_funcall( encoding, rb_intern("default_external="),
+                        1, rb_str_new_cstr("UTF-8") );
+
+            // Apache log constants for log() in ruby_request.cpp
+            rb_define_global_const("APLOG_EMERG",        INT2NUM(APLOG_EMERG));
+            rb_define_global_const("APLOG_ALERT",        INT2NUM(APLOG_ALERT));
+            rb_define_global_const("APLOG_CRIT",         INT2NUM(APLOG_CRIT));
+            rb_define_global_const("APLOG_ERR",          INT2NUM(APLOG_ERR));
+            rb_define_global_const("APLOG_WARNING",      INT2NUM(APLOG_WARNING));
+            rb_define_global_const("APLOG_NOTICE",       INT2NUM(APLOG_NOTICE));
+            rb_define_global_const("APLOG_INFO",         INT2NUM(APLOG_INFO));
+            rb_define_global_const("APLOG_DEBUG",        INT2NUM(APLOG_DEBUG));
+            rb_define_global_const("APLOG_LEVELMASK",    INT2NUM(APLOG_LEVELMASK));
+            rb_define_global_const("APLOG_NOERRNO",      INT2NUM(APLOG_NOERRNO));
+            rb_define_global_const("APLOG_TOCLIENT",     INT2NUM(APLOG_TOCLIENT));
+            rb_define_global_const("APLOG_STARTUP",      INT2NUM(APLOG_STARTUP));
+
+            // Apache method constants
+            rb_define_global_const("M_GET",              INT2NUM(M_GET));
+            rb_define_global_const("M_PUT",              INT2NUM(M_PUT));
+            rb_define_global_const("M_POST",             INT2NUM(M_POST));
+            rb_define_global_const("M_DELETE",           INT2NUM(M_DELETE));
+            rb_define_global_const("M_CONNECT",          INT2NUM(M_CONNECT));
+            rb_define_global_const("M_OPTIONS",          INT2NUM(M_OPTIONS));
+            rb_define_global_const("M_TRACE",            INT2NUM(M_TRACE));
+            rb_define_global_const("M_PATCH",            INT2NUM(M_PATCH));
+            rb_define_global_const("M_PROPFIND",         INT2NUM(M_PROPFIND));
+            rb_define_global_const("M_PROPPATCH",        INT2NUM(M_PROPPATCH));
+            rb_define_global_const("M_MKCOL",            INT2NUM(M_MKCOL));
+            rb_define_global_const("M_COPY",             INT2NUM(M_COPY));
+            rb_define_global_const("M_MOVE",             INT2NUM(M_MOVE));
+            rb_define_global_const("M_LOCK",             INT2NUM(M_LOCK));
+            rb_define_global_const("M_UNLOCK",           INT2NUM(M_UNLOCK));
+            rb_define_global_const("M_VERSION_CONTROL",  INT2NUM(M_VERSION_CONTROL));
+            rb_define_global_const("M_CHECKOUT",         INT2NUM(M_CHECKOUT));
+            rb_define_global_const("M_UNCHECKOUT",       INT2NUM(M_UNCHECKOUT));
+            rb_define_global_const("M_CHECKIN",          INT2NUM(M_CHECKIN));
+            rb_define_global_const("M_UPDATE",           INT2NUM(M_UPDATE));
+            rb_define_global_const("M_LABEL",            INT2NUM(M_LABEL));
+            rb_define_global_const("M_REPORT",           INT2NUM(M_REPORT));
+            rb_define_global_const("M_MKWORKSPACE",      INT2NUM(M_MKWORKSPACE));
+            rb_define_global_const("M_MKACTIVITY",       INT2NUM(M_MKACTIVITY));
+            rb_define_global_const("M_BASELINE_CONTROL", INT2NUM(M_BASELINE_CONTROL));
+            rb_define_global_const("M_MERGE",            INT2NUM(M_MERGE));
+            rb_define_global_const("M_INVALID",          INT2NUM(M_INVALID));
+            rb_define_global_const("M_METHODS",          INT2NUM(64));
+
+            // Submodules are registered under the Apache namespace
+            VALUE apache = rb_define_module("Apache");
+
+            // ModRuby module functions under ModRuby namespace
+            VALUE ruby = rb_define_module("ModRuby");
+
+            rb_define_module_function(ruby, "version", (fn)ruby_version, 0);
+            rb_define_module_function(ruby, "release_date", (fn)ruby_release_date, 0);
+
+            // RHTML scanner
+
+            init_rhtml();
+
+            // Initialize Ruby extensions/modules
+
+            init_request(apache);     // Apache request Ruby wrapper
+            init_server(apache);      // Apache server Ruby wrapper
+            init_connection(apache);  // Apache connection Ruby wrapper
+            init_process(apache);     // Apache process Ruby wrapper
+
+            VALUE apr = rb_define_module("APR");
+
+            init_apr(apr);           // Apache Portable Runtime (APR)
+            init_apr_array(apr);     // APR Arrays
+            init_apr_file_info(apr); // APR file functions
+            init_apr_pool(apr);      // APR pools
+            init_apr_table(apr);     // APR tables
+
+            // Load the Ruby handler module, which is a pure Ruby class
+            ruby::require("modruby/handler");
+
+            // Create the global Ruby handler instance.
+            ruby_handler = new ruby::Object("ModRuby::Handler");
+        }
+        catch (const ruby::Exception& e)
+        {
+            fprintf(stderr, "Ruby Exception: %s", e.what());
+
+            stringstream strm;
+            strm << "FATAL ERROR: " << e.what();
+            log_error(p, strm.str().c_str());
+
+            return 1;
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "C++ Exception: %s\n", e.what());
+
+            stringstream strm;
+            strm << "FATAL ERROR: " << e.what();
+            log_error(p, strm.str().c_str());
+
+            return 1;
+        }
+
+        return 0;
+    };
+
+    try
+    {
+        return RubyDispatcher::instance().execute(init_job);
+    }
+    catch (const std::exception& e)
+    {
+        ap_log_perror( APLOG_MARK, APLOG_CRIT, 0, p,
+                       "mod_ruby[%i]: initialization failure: %s",
+                       getpid(), e.what() );
+        return 1;
+    }
 }
 
 int ruby_shutdown_module()
 {
-    // Call shutdown on all handlers so they can clean up
-    map<string, ruby::Object*>::iterator i;
-    for(i = handlers.begin(); i != handlers.end(); i++)
+    if (!RubyDispatcher::instance().is_started())
     {
-        ap_log_error( APLOG_MARK, APLOG_NOTICE, 0, NULL,
-                      "mod_ruby[%i]: ruby_shutdown_module() starting",
-                      getpid() );
-
-        try
-        {
-            i->second->method("shutdown", 0);
-        }
-        catch (const ruby::Exception& e)
-        {
-            // Create the error message
-            stringstream strm;
-            strm << "ruby_shutdown_module(): Ruby Exception: " << e.what() << "\n"
-                 << e.stackdump();
-
-            // Log error (critical)
-            ap_log_error( APLOG_MARK, APLOG_CRIT, 0, NULL,
-                          "mod_ruby[%i] : %s",
-                          getpid(),
-                          strm.str().c_str() );
-        }
-        catch (const std::exception& e)
-        {
-            fprintf(stderr, "ruby_shutdown_module(): C++ Exception\n");
-        }
+        return 0;
     }
 
-    if (ruby_handler != NULL)
+    auto shutdown_job = []() -> int
     {
-        ruby_handler->method("shutdown", 0);
+        // Call shutdown on all handlers so they can clean up
+        map<string, ruby::Object*>::iterator i;
+        for(i = handlers.begin(); i != handlers.end(); i++)
+        {
+            ap_log_error( APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                          "mod_ruby[%i]: ruby_shutdown_module() starting",
+                          getpid() );
 
-        delete ruby_handler;
-        ruby_handler = NULL;
+            try
+            {
+                i->second->method("shutdown", 0);
+            }
+            catch (const ruby::Exception& e)
+            {
+                // Create the error message
+                stringstream strm;
+                strm << "ruby_shutdown_module(): Ruby Exception: " << e.what() << "\n"
+                     << e.stackdump();
+
+                // Log error (critical)
+                ap_log_error( APLOG_MARK, APLOG_CRIT, 0, NULL,
+                              "mod_ruby[%i] : %s",
+                              getpid(),
+                              strm.str().c_str() );
+            }
+            catch (const std::exception&)
+            {
+                fprintf(stderr, "ruby_shutdown_module(): C++ Exception\n");
+            }
+
+            delete i->second;
+        }
+
+        if (ruby_handler != NULL)
+        {
+            ruby_handler->method("shutdown", 0);
+
+            delete ruby_handler;
+            ruby_handler = NULL;
+        }
+
+        handlers.clear();
+
+        return 0;
+    };
+
+    int result = 0;
+
+    try
+    {
+        result = RubyDispatcher::instance().execute(shutdown_job);
+    }
+    catch (const std::exception& e)
+    {
+        ap_log_error( APLOG_MARK, APLOG_CRIT, 0, NULL,
+                      "mod_ruby[%i]: shutdown failure: %s",
+                      getpid(), e.what() );
+        result = 1;
     }
 
-    // Shutdown Ruby environment
-    ruby::shutdown();
+    RubyDispatcher::instance().stop();
 
-    return 0;
+    return result;
 }
 
 int ruby_log_error(request_rec* r, int level, const char* msg)
@@ -607,7 +859,9 @@ modruby::Handler ruby_request_get_access_handler(request_rec* r)
     return modruby::Handler();
 }
 
-int ruby_request_handler(request_rec* r)
+// Core HTTP handler implementation that performs the request lifecycle using
+// Ruby objects. This must execute on the Ruby dispatcher thread.
+static int ruby_request_handler_impl(request_rec* r)
 {
     apache::Request req(r);
 
@@ -733,6 +987,12 @@ int ruby_request_handler(request_rec* r)
     }
 }
 
+// Public Apache handler entry point. It delegates to the Ruby dispatcher so
+// the implementation runs with the GVL.
+int ruby_request_handler(request_rec* r)
+{
+    return call_request_with_gvl(ruby_request_handler_impl, r);
+}
 // Common code used for RHTML and Ruby script handlers
 int ruby_generic_handler( request_rec* r,
                           const char* handler_name,
@@ -846,17 +1106,32 @@ int ruby_generic_handler( request_rec* r,
     }
 }
 
-int ruby_request_rhtml_handler(request_rec* r)
+// Implementation for the RHTML content handler that expects the GVL to be held.
+static int ruby_request_rhtml_handler_impl(request_rec* r)
 {
     return ruby_generic_handler(r, "ruby-rhtml-handler", "rhtml");
 }
 
-int ruby_request_script_handler(request_rec* r)
+// Apache hook wrapper for the RHTML handler that ensures execution on the Ruby thread.
+int ruby_request_rhtml_handler(request_rec* r)
+{
+    return call_request_with_gvl(ruby_request_rhtml_handler_impl, r);
+}
+
+// Implementation for the Ruby script handler that requires Ruby VM access.
+static int ruby_request_script_handler_impl(request_rec* r)
 {
     return ruby_generic_handler(r, "ruby-script-handler", "script");
 }
 
-int ruby_request_access_handler(request_rec* r)
+// Apache hook wrapper for the script handler that marshals work through the dispatcher.
+int ruby_request_script_handler(request_rec* r)
+{
+    return call_request_with_gvl(ruby_request_script_handler_impl, r);
+}
+
+// Implementation for the access handler hook. Assumes it runs on the Ruby thread.
+static int ruby_request_access_handler_impl(request_rec* r)
 {
     apache::Request req(r);
 
@@ -963,4 +1238,10 @@ int ruby_request_access_handler(request_rec* r)
         // Otherewise everything was OK.
         return OK;
     }
+}
+
+// Apache hook wrapper for the access handler that schedules execution with the GVL.
+int ruby_request_access_handler(request_rec* r)
+{
+    return call_request_with_gvl(ruby_request_access_handler_impl, r);
 }

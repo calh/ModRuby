@@ -1,10 +1,89 @@
 #include <ruby.h>
 #include <ruby/encoding.h>
+#include <ruby/thread.h>
 #include <sstream>
 
 #include "ruby.hpp"
 
 using std::string;
+
+extern "C" int ruby_thread_has_gvl_p(void);
+
+namespace
+{
+// Holds the parameters/result for invoking rb_protect under the dispatcher.
+struct ProtectCallContext
+{
+    VALUE (*func)(VALUE);
+    VALUE arg;
+    int error;
+    VALUE result;
+};
+
+// Trampoline that re-enters rb_protect while the GVL is held.
+static void* protect_with_gvl(void* data)
+{
+    ProtectCallContext* ctx = static_cast<ProtectCallContext*>(data);
+    ctx->error = 0;
+    ctx->result = rb_protect(ctx->func, ctx->arg, &ctx->error);
+
+    return NULL;
+}
+
+// Calls the supplied Ruby C function inside rb_protect, reacquiring the GVL
+// if the current native thread does not already own it.
+static VALUE call_with_protect(VALUE (*func)(VALUE), VALUE arg, int* error)
+{
+    ProtectCallContext ctx { func, arg, 0, Qnil };
+
+    if (ruby_thread_has_gvl_p())
+    {
+        ctx.error = 0;
+        ctx.result = rb_protect(func, arg, &ctx.error);
+    }
+    else
+    {
+        rb_thread_call_with_gvl(protect_with_gvl, &ctx);
+    }
+
+    if (error != NULL)
+    {
+        *error = ctx.error;
+    }
+
+    return ctx.result;
+}
+
+// Context structure for safely calling rb_load_protect from non-Ruby threads.
+struct LoadCallContext
+{
+    const char* filename;
+    int anonymous;
+    int error;
+};
+
+// Executes rb_load_protect while the GVL is held.
+static void* load_with_gvl(void* data)
+{
+    LoadCallContext* ctx = static_cast<LoadCallContext*>(data);
+    ctx->error = 0;
+    rb_load_protect(rb_str_new_cstr(ctx->filename), ctx->anonymous, &ctx->error);
+    return NULL;
+}
+
+// Runs the given function while ensuring the GVL is owned by this thread.
+static void perform_with_gvl(void* (*func)(void*), void* data)
+{
+    if (ruby_thread_has_gvl_p())
+    {
+        func(data);
+    }
+    else
+    {
+        rb_thread_call_with_gvl(func, data);
+    }
+}
+} // namespace
 
 namespace ruby
 {
@@ -60,9 +139,9 @@ VALUE Object::method(const char* name, int n, ...)
     arg.argv = argv;
 
     int error = 0;
-    VALUE result = rb_protect( ruby::method_wrap,
-                               reinterpret_cast<VALUE>(&arg),
-                               &error );
+    VALUE result = call_with_protect( ruby::method_wrap,
+                                      reinterpret_cast<VALUE>(&arg),
+                                      &error );
 
     if (error)
     {
@@ -435,7 +514,7 @@ VALUE method(VALUE recv, ID id, int n, ...)
     arg.argv = argv;
 
     int error = 0;
-    VALUE result = rb_protect(method_wrap, reinterpret_cast<VALUE>(&arg), &error);
+    VALUE result = call_with_protect(method_wrap, reinterpret_cast<VALUE>(&arg), &error);
 
     if (error)
     {
@@ -469,7 +548,7 @@ VALUE vm_method(VALUE recv, ID id, int n, va_list ar)
     arg.argv = argv;
 
     int error = 0;
-    VALUE result = rb_protect(method_wrap, reinterpret_cast<VALUE>(&arg), &error);
+    VALUE result = call_with_protect(method_wrap, reinterpret_cast<VALUE>(&arg), &error);
 
     if (error)
     {
@@ -546,7 +625,7 @@ bool call_function(const char* method, int n, ...)
 void require(const char* filename)
 {
     int error = 0;
-    rb_protect(require_protect, reinterpret_cast<VALUE>(filename), &error);
+    call_with_protect(require_protect, reinterpret_cast<VALUE>(filename), &error);
 
     if (error)
     {
@@ -562,10 +641,10 @@ void require(const char* filename)
 
 void load(const char* filename, int anonymous)
 {
-    int error = 0;
-    rb_load_protect(rb_str_new2(filename), anonymous, &error);
+    LoadCallContext ctx { filename, anonymous, 0 };
+    perform_with_gvl(load_with_gvl, &ctx);
 
-    if (error)
+    if (ctx.error)
     {
         Exception e;
         e.backtrace();
@@ -618,7 +697,7 @@ VALUE create_object(const char* class_name, int n, va_list ar)
     arg.argv = argv;
 
     int error = 0;
-    VALUE self = rb_protect(create_object_protect, reinterpret_cast<VALUE>(&arg), &error);
+    VALUE self = call_with_protect(create_object_protect, reinterpret_cast<VALUE>(&arg), &error);
 
     if (error)
     {

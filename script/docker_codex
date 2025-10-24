@@ -1,0 +1,26 @@
+#!/bin/bash
+root=$( readlink -f $( dirname $( readlink -f $0 ) )/.. )
+docker build -f $root/Dockerfile.codex -t mod_ruby_codex $root
+
+docker rm -f mod_ruby_codex_run_container
+# Change 8080 here if you have a local conflict with it
+docker run \
+  --name=mod_ruby_codex_run_container \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v $root:/usr/src/mod_ruby \
+  -v $HOME/.codex:/root/.codex \
+  -d \
+  -p 8080:80 \
+  mod_ruby_codex \
+  /bin/sleep infinity
+
+# Start up Apache in the background.  This script will loop
+# restarting Apache when it crashes.  Stack traces are logged
+# for the Codex agent to inspect.
+docker exec -d mod_ruby_codex_run_container /httpd-gdb-loop
+#docker exec -ti mod_ruby_codex_run_container /httpd-gdb-loop
+
+# Run the Codex agent with full access and web search
+docker exec -ti mod_ruby_codex_run_container codex --sandbox danger-full-access --search --cd /usr/src/mod_ruby 
+
