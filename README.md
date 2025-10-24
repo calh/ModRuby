@@ -44,7 +44,7 @@ The build will create these files in the local repo:
 
 To build from source, you need to the following packages:
 
-  * Ruby 1.9 or 2.x. (Ruby header files also needed).
+  * Ruby 2.x or 3.x. (Ruby header files also needed).
   * Apache, APR and APR Util headers
   * CMake
 
@@ -69,7 +69,7 @@ using the Docker image as a handy developer's environment:
 
     bash $ ./script/docker_run
     ... 
-    0x00007f30bb13733f in accept4 () from /lib64/libc.so.6
+    0x00007f7a7adfc7b4 in read () from /lib64/libpthread.so.0
 
 A single Apache worker child is running in a gdb shell. Smoke test mod_ruby in a
 separate terminal window:
@@ -77,7 +77,7 @@ separate terminal window:
     bash $ curl localhost:8080
     Hi there from ruby
     <html><body>Hello World from HTML!</body></html>
-
+    
 If mod_ruby crashes, gdb will print a full stack trace. You may also do
 `Ctrl + C` to break out to a gdb prompt to inspect the running Apache child.
 
@@ -86,6 +86,60 @@ rebuild the Docker image.  Alter httpd.conf and test.rb to create different test
 cases.
 
 Submit pull requests using feature branches, and have fun!
+
+### Developing with OpenAI Codex
+
+Working with the Ruby C API can be frustrating.  Documentation is sparse
+and a lot of the experience is trial & error.
+
+This project integrates OpenAI's Codex for an agentic approach.  There
+is a separate `Dockerfile.codex` which loads in the full Ruby C++ headers
+and source code and installs the Codex CLI.  The project root contains
+an AGENTS.md system prompt to tell the LLM how to compile, install
+and test ModRuby.  It can run web searches, install packages as root, 
+search the Ruby source and behave like an entitled twerp.
+
+Apache is started up with the container and will run in a reload loop 
+if it crashes.  The agent is given instructions to test changes and 
+inspect the stack trace if Apache segfaults.  It should keep iterating 
+until the goal is met, which could be a very long time.  
+
+**Use with caution.  Don't leave it run unattended.**
+
+First, install [Codex CLI](https://developers.openai.com/codex/cli/)
+on your workstation and get the credentials set up by logging into ChatGPT.  
+The `ModRuby` container bind mounts your workstation's `$HOME/.codex` 
+into the container and runs the agent inside the container.  The `ModRuby` 
+project root is bind mounted into `/usr/src/mod_ruby` so changes made by the 
+agent will be reflected immediately on your host OS.
+
+Start up the container with:
+
+    bash $ ./script/docker_codex 
+    . . . 
+    To get started, describe a task or try one of these commands: 
+    >
+
+Go wild and have fun.  
+
+```
+> Search for a potential security vulnerability in ModRuby.  Identify the 
+  attack vector and write a test case to confirm the vulnerability.  Write 
+  a patch to fix the vulnerability and supply code comments.
+```
+
+```
+Updated Plan
+  High-level roadmap before diving into the source and modifications.
+    Survey key ModRuby modules for input handling to spot potential security issues.
+    Create a regression test that demonstrates the vulnerability.
+    Implement a fix with comments, rebuild, and rerun the new test.
+ 
+I'm focusing on confirming an overflow issue in url_encode by running a 
+death test with MALLOC_CHECK set to catch heap errors.  I'm thinking about 
+creating a dedicated test compiled with AddressSanitizer to catch the integer 
+overflow vulnerability in url_encode by triggering a heap-buffer-overflow if present.
+```
 
 ## License
 
